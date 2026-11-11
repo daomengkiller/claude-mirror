@@ -1,0 +1,164 @@
+name: mirror-claude-desktop
+
+# 网页手动触发：仓库 → Actions → mirror-claude-desktop → Run workflow
+# 也可以每天定时自检一次新版本（不需要就删掉 schedule 段）
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "同版本也重建 release（true/false）"
+        default: "false"
+      keep_releases:
+        description: "保留最近几个 release"
+        default: "2"
+      max_total_mb:
+        description: "release 资产总大小上限(MB)，超出就删最旧的"
+        default: "3000"
+  schedule:
+    - cron: "17 3 * * *"
+
+run-name: "mirror ${{ github.event.inputs.force == 'true' && '(force)' || '' }}"
+
+concurrency:
+  group: mirror-claude-desktop
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    name: 抓取并发布 Claude Desktop 安装包
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: 1. 取仓库
+        uses: actions/checkout@v4
+
+      - name: 2. 解析官方最新版本
+        id: resolve
+        run: |
+          set -euo pipefail
+          chmod +x resolve.sh
+          bash resolve.sh > manifest.json
+          echo "--- manifest ---"; cat manifest.json
+          VER="$(cat .version)"
+          echo "VERSION=$VER" >> "$GITHUB_ENV"
+          echo "TAG=v$VER"        >> "$GITHUB_ENV"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "资产数: $(jq length manifest.json)"
+
+      - name: 3. 判断该版本是否已发布
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "已存在 release $TAG"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "release $TAG 不存在，准备创建"
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 4. 下载全部安装包
+        if: steps.check.outputs.exists == 'false' || inputs.force == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          jq -r '.[] | "\(.url)\t\(.file)"' manifest.json > urls.tsv
+          while IFS=$'\t' read -r url file; do
+            printf '%s\0%s\0' "$url" "out/$file"
+          done < urls.tsv | xargs -0 -n2 -P4 bash -c '
+            set -euo pipefail
+            url="$1"; out="$2"
+            echo "↓ $out"
+            curl -fL --retry 5 --retry-delay 3 --retry-all-errors -C - -o "$out" "$url"
+          ' _
+          echo "--- 下载结果 ---"
+          ls -lh out
+          ( cd out && sha256sum ./* > SHA256SUMS.txt )
+          cp manifest.json out/manifest.json
+          cp download-helper.sh out/download-helper.sh
+          ls -lh out
+
+      - name: 5. 清理旧 release（存储上限 / 保留份数）
+        if: steps.check.outputs.exists == 'false' || inputs.force == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          KEEP="${{ inputs.keep_releases }}"; KEEP="${KEEP:-2}"
+          MAXMB="${{ inputs.max_total_mb }}"; MAXMB="${MAXMB:-3000}"
+          NEW=$(du -sb out | cut -f1)
+          echo "本次新增: $((NEW/1024/1024)) MB；上限 ${MAXMB} MB；保留 ${KEEP} 份"
+
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq 'sort_by(.created_at) | .[] | [.id, .tag_name, ([.assets[].size] | add // 0)] | @tsv' \
+            > /tmp/rels.tsv || true
+          cat /tmp/rels.tsv || true
+
+          TOTAL=$(awk -F'\t' '{s+=$3} END{printf "%d", s+0}' /tmp/rels.tsv)
+          echo "当前占用: $((TOTAL/1024/1024)) MB，共 $(wc -l < /tmp/rels.tsv) 个 release"
+
+          n=0
+          while IFS=$'\t' read -r id tag size; do
+            [ -n "${id:-}" ] || continue
+            n=$((n+1))
+            # 超过保留份数，或加上本次后超上限，就删最旧的
+            if [ "$n" -le $(( $(wc -l < /tmp/rels.tsv) - KEEP + 1 )) ] || [ $((TOTAL + NEW)) -gt $((MAXMB * 1024 * 1024)) ]; then
+              echo "删除旧 release: $tag (id=$id, $((size/1024/1024)) MB)"
+              gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id" || true
+              TOTAL=$((TOTAL - size))
+            fi
+          done < /tmp/rels.tsv
+          echo "清理后占用: $((TOTAL/1024/1024)) MB"
+
+      - name: 6. 发布 Release
+        if: steps.check.outputs.exists == 'false' || inputs.force == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "同版本已存在，删掉重建（force）"
+            gh release delete "$TAG" -y --cleanup-tag || true
+          fi
+
+          {
+            echo "## Claude Desktop $VERSION"
+            echo
+            echo "官方源：\`https://claude.ai/download\`  ·  镜像时间：$(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo
+            echo "| 平台 | 文件 | 大小 |"
+            echo "| --- | --- | --- |"
+            jq -r '.[] | "| \(.platform) | `\(.file)` | \(.size/1024/1024*10|floor/10) MB |"' manifest.json
+            echo
+            echo "校验：\`sha256sum -c SHA256SUMS.txt\`"
+            echo
+            echo "国内下载：\`MIRROR=https://ghfast.top/ bash download-helper.sh $TAG\`"
+          } > notes.md
+          cat notes.md
+
+          gh release create "$TAG" out/* \
+            --title "Claude Desktop $VERSION" \
+            --notes-file notes.md \
+            --latest
+
+      - name: 7. 汇总
+        if: always()
+        run: |
+          {
+            echo "## 镜像结果"
+            echo
+            echo "- 版本：\`${{ steps.resolve.outputs.version }}\`"
+            echo "- Tag：\`$TAG\`"
+            echo "- 已存在：\`${{ steps.check.outputs.exists }}\`"
+            echo "- 发布页：${{ github.server_url }}/${{ github.repository }}/releases"
+            echo
+            [ -f notes.md ] && cat notes.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+
