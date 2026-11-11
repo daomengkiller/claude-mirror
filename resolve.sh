@@ -55,9 +55,13 @@ done < "$TMP/urls.txt"
 
 jq -s 'sort_by(.platform)' "$TMP/items.jsonl"
 
-# 版本号：从文件名里抽 x.y.z
-VER=$(jq -r '.[].file' "$TMP/items.jsonl" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1 || true)
-echo "· 解析到版本: ${VER:-未知}" >&2
-printf '%s' "${VER:-unknown}" > .version
+# 版本号：从文件名里抽 x.y.z（items.jsonl 是 JSON 流，用 .file 直接取）
+VER=$(jq -r '.file // empty' "$TMP/items.jsonl" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1 || true)
+if [ -z "${VER:-}" ]; then
+  echo "· 版本号解析失败，终止（避免发布出 vunknown 这种垃圾 tag）" >&2
+  exit 3
+fi
+echo "· 解析到版本: $VER" >&2
+printf '%s' "$VER" > .version
 
 
